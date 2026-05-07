@@ -1,0 +1,233 @@
+---
+title: "Honors Thesis"
+format: pdf
+editor: visual
+---
+
+## Libraries
+
+```{r}
+library(tidyverse)
+library(readxl)
+library(lubridate)
+```
+
+## Clean QWI Distress Data
+
+```{r}
+raw_qwi <- read_csv("~/Downloads/qwi_f5513339c9334a45b599500816c6a08e.csv")
+
+clean_qwi <- raw_qwi %>%
+  filter(firmsize %in% c(1, 2, 3, 4, 5)) %>%
+  
+  mutate(
+    Size_Category = case_when(
+      firmsize == 1 ~ "Small (0-19 emps)",
+      firmsize == 2 ~ "Small-Med (20-49 emps)",
+      firmsize == 3 ~ "Medium (50-249 emps)",
+      firmsize == 4 ~ "Med-Large (250-499 emps)",
+      firmsize == 5 ~ "Large (500+ emps)"
+    ),
+    
+    Year_Quarter = paste0(year, "-Q", quarter),
+    
+    # THE INDUSTRY FIX: Tell R that "31-33" means "33" so it matches the crosswalk
+    NAICS_Code = ifelse(industry == "31-33", "33", as.character(industry))
+  ) %>%
+  
+  # THE METRIC FIX: Use 'FrmJbLs' (Firm Job Loss) instead of 'Sep'
+  dplyr::select(Year_Quarter, year, quarter, NAICS_Code, Size_Category, Emp, FrmJbLs)
+```
+
+## Clean Concordance Code Data
+
+```{r}
+raw_crosswalk <- read_excel("~/Downloads/impconcord25.xlsx", col_types = "text")
+
+clean_crosswalk <- raw_crosswalk %>%
+  mutate(
+    # Make code the international 6 digit standard
+    HTS_6 = substr(commodity, 1, 6),
+    
+    # Match the 6 digit to the 2 digit QWI sectors 
+    NAICS_Code = substr(naics, 1, 2)) %>%
+  distinct(HTS_6, NAICS_Code)
+```
+
+## Combine and Clean Tariff Shock Data
+
+```{r}
+library(tidyverse)
+
+tariff_2018 <- read_excel("~/Downloads/tariff_data_2018/tariff_database_2018.xlsx", col_types = "text") %>% 
+  mutate(year = 2018, mfn_ad_val_rate = as.numeric(mfn_ad_val_rate))
+
+tariff_2019 <- read_excel("~/Downloads/tariff_data_2019/2019_Tariff_Database_v11.xlsx", col_types = "text") %>% 
+  mutate(year = 2019, mfn_ad_val_rate = as.numeric(mfn_ad_val_rate))
+
+tariff_2025 <- read_excel("~/Downloads/tariff_data_2025/tariff_database_2025.xlsx", col_types = "text") %>% 
+  mutate(year = 2025, mfn_ad_val_rate = as.numeric(mfn_ad_val_rate))
+
+tariff_2026 <- read_excel("~/Downloads/tariff_data_2026/tariff_database_2026.xlsx", col_types = "text") %>% 
+  mutate(year = 2026, mfn_ad_val_rate = as.numeric(mfn_ad_val_rate))
+
+# Make them one master dataframe
+raw_tariffs <- bind_rows(tariff_2018, tariff_2019, tariff_2025, tariff_2026)
+
+# Clean combined tariff data 
+clean_tariffs <- raw_tariffs %>%
+  mutate(
+    HTS_6 = substr(hts8, 1, 6),
+    Statutory_Tariff_Rate = mfn_ad_val_rate * 100
+  ) %>%
+  filter(!is.na(Statutory_Tariff_Rate)) %>%
+  
+  # Average the 8 digit rates into a single 6 digit rate per year
+  group_by(year, HTS_6) %>%
+  summarize(
+    Statutory_Tariff_Rate = mean(Statutory_Tariff_Rate, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+```
+
+## Merge all
+
+```{r}
+# Attach Industry codes to the Tariff Data
+tariffs_with_industry <- clean_tariffs %>%
+  left_join(clean_crosswalk, by = "HTS_6", relationship = "many-to-many") %>%
+  filter(!is.na(NAICS_Code))
+
+# Aggregate Tariffs to the Industry-Year level
+industry_tariffs <- tariffs_with_industry %>%
+  group_by(year, NAICS_Code) %>%
+  summarize(
+    Avg_Tariff_Rate = mean(Statutory_Tariff_Rate, na.rm = TRUE),
+    .groups = 'drop'
+  )
+
+# Final Join
+final_did_panel <- clean_qwi %>%
+  left_join(industry_tariffs, by = c("year", "NAICS_Code")) %>%
+  mutate(
+    Avg_Tariff_Rate = replace_na(Avg_Tariff_Rate, 0),
+    Is_Treated = ifelse(Avg_Tariff_Rate > 0, 1, 0),
+    
+    # Calculate the Distress Metric (Jobs Destroyed / Total Employment)
+    Job_Loss_Rate = FrmJbLs / Emp
+  )
+```
+
+## Bring is BTOS index data for 2025-2026
+
+```{r}
+
+raw_btos <- read_excel("~/Downloads/Sector by Employment Size Class.xlsx", sheet = "Index Estimates", col_types = "text")
+
+clean_btos <- raw_btos %>%
+  # Filter to specific size brackets 
+  filter(!is.na(Sector), nchar(Sector) <= 2, Empsize != "XX") %>%
+  
+  # Rename 'Sector' to match the tariff dataset
+  rename(NAICS_Code = Sector) %>%
+  
+  # Take the date columns and melt them down into two new columns
+  pivot_longer(
+    cols = starts_with("20"), 
+    names_to = "Cycle_Date", 
+    values_to = "Distress_Index"
+  ) %>%
+  
+  # Clean up the dates and sizes so we can join to the tariffs
+  mutate(
+    year = as.numeric(substr(Cycle_Date, 1, 4)),
+    
+    # Translate the BTOS size codes to readable labels
+    Size_Category = case_when(
+      Empsize == "A" ~ "Small (1-4 emps)",
+      Empsize == "B" ~ "Small (5-9 emps)",
+      Empsize %in% c("C", "D") ~ "Medium (10-49 emps)",
+      Empsize %in% c("E", "F") ~ "Med-Large (50-249 emps)",
+      Empsize == "G" ~ "Large (250+ emps)"
+    ),
+    Distress_Index = ifelse(Distress_Index == ".", NA, Distress_Index),
+    Distress_Index = as.numeric(Distress_Index)
+  ) %>%
+  
+  # Filter out missing data
+  filter(!is.na(Distress_Index)) %>%
+  
+  # Keep only what we need
+  dplyr::select(year, Cycle_Date, NAICS_Code, Size_Category, `Option Text`, Distress_Index)
+
+final_btos <- clean_btos %>%
+  left_join(industry_tariffs, by = c("year", "NAICS_Code")) %>%
+  mutate(
+    # If an industry had no tariffs, set it to a 0% rate
+    Avg_Tariff_Rate = replace_na(Avg_Tariff_Rate, 0),
+    
+    # Create the Treatment Dummy for the regression
+    Is_Treated = ifelse(Avg_Tariff_Rate > 0, 1, 0)
+  ) %>%
+  # Focus specifically on the "Future demand"
+  filter(`Option Text` == "Future demand")
+```
+
+## Linear Model for 2018-2019
+
+```{r}
+model_1 <- lm(Job_Loss_Rate ~ Avg_Tariff_Rate + Size_Category + (Avg_Tariff_Rate * Size_Category), data = final_did_panel)
+summary(model_1)
+```
+
+In 2018-2019, small-medium and medium businesses were hit the hardest compared to large businesses and show high statistical significance with p-values close to 0. Surprisingly, the most small size of businesses did not show statistical significance in getting hit by the tariffs compared to large businesses, but sometimes these businesses are so niche that it isolates them from tariff influenced industries.
+
+## Linear Model for 2025-2026
+
+```{r}
+model_2 <- lm(Distress_Index ~ Avg_Tariff_Rate + Size_Category + (Avg_Tariff_Rate * Size_Category), data = final_btos)
+summary(model_2)
+```
+
+It seems for 2025-206, businesses are being hurt from tariffs across the board. It is not specifically hitting small businesses worse according to business survey responses. Medium is the closest to seeing statistical significance though, which is similar to 2018-2019 and could be a sign that trends will be the same. It is also important to note that even if small businesses have the same impact as larger businesses, smaller businesses are less equipped to deal with the negative impact.
+
+The 2018 data does also show a lagged effect, so we may see this impact on the 2025-2026 more in the future.
+
+```{r}
+library(lmtest)
+library(sandwich)
+library(car)
+
+par(mfrow = c(2, 2)) 
+plot(model_1) 
+par(mfrow = c(1, 1)) 
+
+
+robust_model_1 <- coeftest(model_1, vcov = vcovHC(model_1, type = "HC1"))
+print(robust_model_1)
+
+
+vif(model_1)
+```
+
+```{r}
+
+model_glm <- glm(Job_Loss_Rate ~ Avg_Tariff_Rate + Size_Category + (Avg_Tariff_Rate * Size_Category), 
+                 family = quasibinomial(link = "logit"), 
+                 data = final_did_panel)
+
+summary(model_glm)
+
+par(mfrow = c(2, 2)) 
+plot(model_glm) 
+par(mfrow = c(1, 1)) 
+
+robust_model_glm <- coeftest(model_glm, vcov = vcovHC(model_glm, type = "HC1"))
+print(robust_model_glm)
+
+
+vif(model_glm)
+```
+
+The initial OLS linear model showed that tariffs increased job destruction more in small-medium businesses than the smallest one. However, diagnostics showed the though there was not a multicollinearity problem, there was heteroskedasticity. To correct this, I tried a GLM model, and micro small companies showed the biggest hit with tariffs followed by small-medium ones.
